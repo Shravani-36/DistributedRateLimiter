@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # fakeredis stands in for Redis, so no service container is needed.
+      - name: Run tests
+        run: pytest -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check app tests
+      - run: ruff format --check app tests
+
+  integration:
+    name: Against a real Redis
+    runs-on: ubuntu-latest
+    # fakeredis is not Redis. This job runs the limiter against the real
+    # thing, so a Lua script that only works in the fake cannot slip through.
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Start the API
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          RATE_LIMIT: "5"
+          WINDOW_SECONDS: "60"
+          ALGORITHM: sliding
+        run: |
+          uvicorn app.main:app --port 8000 --log-level warning &
+          for i in $(seq 1 20); do
+            # `if` keeps a failing curl from tripping `set -e` while the
+            # server is still starting up.
+            if curl -sf localhost:8000/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+      - name: The 6th request of 5 must be throttled
+        run: |
+          codes=$(for i in $(seq 1 6); do
+            curl -s -o /dev/null -w "%{http_code} " -H "X-API-Key: ci" localhost:8000/api/data
+          done)
+          echo "got: $codes"
+          [ "$codes" = "200 200 200 200 200 429 " ] || exit 1
+
+      - name: Concurrent requests must not overshoot the limit
+        run: |
+          allowed=$(seq 1 60 | xargs -P 60 -I{} \
+            curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: race" \
+            localhost:8000/api/data | grep -c 200)
+          echo "allowed: $allowed (limit 5)"
+          [ "$allowed" = "5" ] || exit 1
+
+      - name: Metrics must be exposed and exclude their own scrapes
+        run: |
+          curl -sf localhost:8000/metrics | grep -q "^rl_requests_total" || exit 1
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t rate-limiter:ci .
+      - name: Image must start and answer
+        run: |
+          docker network create rl-ci
+          docker run -d --name redis --network rl-ci redis:7-alpine
+          docker run -d --name api --network rl-ci -p 8000:8000 \
+            -e REDIS_URL=redis://redis:6379/0 rate-limiter:ci
+          for i in $(seq 1 20); do
+            # `if` keeps a failing curl from tripping `set -e` while the
+            # server is still starting up.
+            if curl -sf localhost:8000/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf localhost:8000/health | grep -q '"redis":true'
+
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install kubernetes-validate pyyaml
+      - name: Validate against Kubernetes 1.31 schemas
+        run: |
+          python - <<'PY'
+          import glob
+          import kubernetes_validate
+          import yaml
+
+          for path in sorted(glob.glob("k8s/*.yaml")):
+              for doc in yaml.safe_load_all(open(path)):
+                  if not doc:
+                      continue
+                  kubernetes_validate.validate(doc, "1.31", strict=True)
+                  print(f"ok  {path}  {doc['kind']}/{doc['metadata']['name']}")
+          PY

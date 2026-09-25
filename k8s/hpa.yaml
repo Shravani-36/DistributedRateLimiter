@@ -1,0 +1,32 @@
+# Scale the API pods on CPU. Needs metrics-server:
+#   minikube addons enable metrics-server
+#
+# Worth understanding: adding pods raises how much traffic the API can
+# *handle*, it does not raise anyone's rate limit. The limit lives in Redis
+# and is shared, so 10 pods enforce the same 10 requests/minute that 3 do.
+# That is the difference between scaling capacity and scaling permission.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      # React quickly to a burst.
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # Come down slowly, so a brief lull does not cause flapping.
+      stabilizationWindowSeconds: 300

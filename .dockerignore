@@ -1,0 +1,13 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.github/
+tests/
+loadtest/
+k8s/
+monitoring/
+*.md
+.env

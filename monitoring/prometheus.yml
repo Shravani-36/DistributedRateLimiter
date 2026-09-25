@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Each API process keeps its own counters, so all three are scraped and the
+  # dashboard sums across them.
+  - job_name: rate-limiter-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - api1:8000
+          - api2:8000
+          - api3:8000
+    relabel_configs:
+      # Label each series with a short instance name (api1 rather than
+      # api1:8000), so the dashboard legends stay readable.
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+        replacement: "$1"
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

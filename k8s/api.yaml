@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rate-limiter-config
+data:
+  REDIS_URL: redis://redis:6379/0
+  RATE_LIMIT: "10"
+  WINDOW_SECONDS: "60"
+  ALGORITHM: sliding
+  FAIL_OPEN: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        # Lets a Prometheus running in-cluster discover these pods.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: api
+          image: rate-limiter:1.0
+          # The image is built straight into the cluster's Docker daemon
+          # (see k8s/README.md), so there is nothing to pull from a registry.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: rate-limiter-config
+          env:
+            # X-Instance then shows the pod name, so you can see the load
+            # balancing while the shared limit still holds.
+            - name: INSTANCE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            # A CPU request is what the HorizontalPodAutoscaler measures
+            # against - without it, autoscaling on CPU cannot work.
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            # /health is 200 while the pod can serve traffic, and 503 only
+            # when failing closed with Redis down - exactly when this pod
+            # should leave the Service's endpoints.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            # Deliberately NOT /health: with FAIL_OPEN=false a Redis outage
+            # makes /health return 503, and a liveness probe on it would
+            # restart every pod in a loop over a dependency being down.
+            # Liveness answers "is this process wedged?", nothing more.
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: NodePort
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: http
+      nodePort: 30080

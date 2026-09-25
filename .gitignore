@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Redis snapshot written when running redis-server locally
+dump.rdb

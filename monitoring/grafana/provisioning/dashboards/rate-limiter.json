@@ -1,0 +1,344 @@
+{
+  "uid": "rate-limiter",
+  "title": "Distributed Rate Limiter",
+  "description": "Traffic allowed vs throttled, limiter latency, and Redis health across all API instances.",
+  "tags": ["rate-limiter", "redis"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+        "query": "label_values(rl_requests_total, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Headline",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Allowed",
+      "description": "Requests per second passing the limit.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(rl_requests_total{result=\"allowed\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "allowed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 0,
+          "color": { "mode": "fixed", "fixedColor": "green" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Throttled",
+      "description": "Requests per second rejected with 429. Not errors - this is the limiter working.",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(rl_requests_total{result=\"blocked\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "throttled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 0,
+          "color": { "mode": "fixed", "fixedColor": "orange" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Throttled share",
+      "description": "Share of traffic being rejected. A sustained high value means clients are over their limits.",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(rl_requests_total{result=\"blocked\", instance=~\"$instance\"}[1m])) / clamp_min(sum(rate(rl_requests_total{instance=~\"$instance\"}[1m])), 0.001)",
+          "legendFormat": "throttled share"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "red", "value": 0.75 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Limit check p95",
+      "description": "Time spent deciding whether a request is allowed. This is the cost the limiter adds to every request.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(rl_check_duration_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red", "value": 0.2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Traffic",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Allowed vs throttled",
+      "description": "The shape of a rate limiter under load: allowed flattens at the limit while throttled absorbs the excess.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(rl_requests_total{result=\"allowed\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "allowed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(rl_requests_total{result=\"blocked\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "throttled (429)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisLabel": "requests / second"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "allowed" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "throttled (429)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per instance",
+      "description": "All instances share one Redis, so the limit is enforced no matter how the load balancer spreads traffic. Uneven lines here do not mean an uneven limit.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(rl_requests_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "axisLabel": "requests / second"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Latency and Redis health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Limit check latency",
+      "description": "Percentiles of the limit check itself, from the histogram. Watch p99 for the tail Redis occasionally adds.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(rl_check_duration_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(rl_check_duration_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rl_check_duration_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "axisLabel": "seconds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis failures and degraded decisions",
+      "description": "Anything above zero means limits are not really being enforced: the fallback policy is answering instead.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "rate-limiter-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(rl_redis_errors_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "redis errors"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(rl_degraded_requests_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "degraded decisions"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisLabel": "per second"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "redis errors" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "degraded decisions" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}

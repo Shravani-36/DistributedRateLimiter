@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+redis
+pydantic-settings
+prometheus-client
+
+# testing
+pytest
+httpx
+fakeredis[lua]
