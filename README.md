@@ -10,7 +10,7 @@ API rate limiting that holds **across every server**, not once per server.
 
 **FastAPI · Redis · Lua · Docker · Kubernetes · Prometheus · Grafana · k6**
 
-```
+```text
    client ──▶ Nginx ──┬──▶ API 1 ──┐
                       ├──▶ API 2 ──┼──▶ Redis   ONE counter
                       └──▶ API 3 ──┘            = ONE limit
@@ -28,9 +28,18 @@ docker compose up --build
 
 ```bash
 for i in $(seq 1 12); do
-  curl -s -o /dev/null -w "%{http_code} " -H "X-API-Key: user1" localhost:8080/api/data
+  curl -s -o /dev/null -w "%{http_code} " \
+    -H "X-API-Key: user1" \
+    localhost:8080/api/data
 done
+
 # 200 200 200 200 200 200 200 200 200 200 429 429
+```
+
+API documentation:
+
+```text
+http://localhost:8080/docs
 ```
 
 ---
@@ -38,13 +47,15 @@ done
 ## 🔬 Proof it's actually distributed
 
 Three containers running proves nothing. This sends requests **straight at each
-container**, bypassing Nginx, so nothing can be explained away as load balancing:
+container**, bypassing Nginx, so the result cannot be explained by load balancing:
 
 ```bash
 python scripts/prove_distributed.py --with-failure
 ```
 
-```
+Example:
+
+```text
  #  sent to   status  answered by
 10  api1      OK      3d60c5812ca5
 11  api2      429     3033c8582dd4     <-- api2 rejects its 4th request
@@ -55,164 +66,424 @@ TOTAL ALLOWED         : 10   (limit: 10)
 if each counted alone : 30
 ```
 
-Request 11 is the whole project in one line: **api2 rejects a request it never
-served**, because api1 and api3 already spent the budget.
+Request 11 demonstrates the distributed behavior: **api2 rejects a request it
+never counted locally**, because api1 and api3 already spent the shared budget.
 
-The same script also fires **100 simultaneous requests** at one key (`allowed=10,
-rejected=90, errors=0`, three rounds) and kills Redis to show the failure policy.
+The same script can also send concurrent requests and test Redis failure behavior.
 
 ---
 
 ## 🧠 How it works
 
-**Why Redis?** The limit must be one number every instance can see. In process
-memory it isn't shared — 3 instances × 10 becomes 30.
+### Why Redis?
 
-**Why Lua?** Because *check* and *increment* must be one step. Two instances can
-otherwise both read "9 used", both see room, and both admit a request — 11 through
-a limit of 10. Redis runs the script atomically, so trim → count → add can't be
-split. That's why 100-way concurrency gives exactly 10, not "about 10".
+The limit must be one shared value that every API instance can see.
 
-**Whose clock?** Redis'. Every script reads `redis.call('TIME')` rather than the
-API container's clock, so drift between hosts can't make one instance think a
-request has aged out while another still counts it. One clock, one decision.
+With an in-memory limiter:
 
-### Three algorithms
-
-| `ALGORITHM` | Strength | Weakness | Memory per client |
-|---|---|---|---|
-| `fixed` | Simplest, cheapest | Boundary burst — 2× the limit across an edge | 1 integer |
-| `sliding` *(default)* | Accurate rolling limit | Stores every request in the window | N entries |
-| `token_bucket` | Allows controlled bursts | Approximates; no exact "N per window" | 2 numbers |
-
-**Fixed window** chops time into buckets and counts per bucket. A client can send
-the full limit at `0:59` and again at `1:01` — double the limit in two seconds. A
-load test caught exactly that: fixed allowed **10,000** where sliding allowed **5,000**.
-
-**Sliding window** keeps a timestamp per request and always looks at the last
-`window` seconds, so that burst is rejected. It frees the whole allowance at once
-when old requests age out.
-
-**Token bucket** holds `burst` tokens, refills at `RATE_LIMIT/WINDOW_SECONDS` per
-second, and spends one per request. An idle client banks a spike; a busy one is
-*paced* — one token drips back at a time instead of the window reopening in a clump.
-Memory is two numbers per client no matter the traffic.
-
+```text
+3 instances × 10 requests = 30 requests
 ```
-sliding : ██████████░░░░░░░░░░ ──▶ ██████████   all 10 back at once
-bucket  : ██████████░░░░░░░░░░ ──▶ █░█░█░█░█░   one back every 6s
+
+With Redis:
+
+```text
+API 1 ─┐
+API 2 ─┼──▶ Redis ──▶ ONE shared limit
+API 3 ─┘
 ```
+
+### Why Lua?
+
+Rate-limit **check + update** must happen atomically.
+
+Without atomicity, two instances could both read:
+
+```text
+9 requests used
+```
+
+Both could accept a request and produce:
+
+```text
+11 requests
+```
+
+for a limit of 10.
+
+The Redis Lua script performs the required operations atomically.
+
+### Shared clock
+
+The rate-limiting scripts use Redis server time rather than each API
+container's local clock. This avoids inconsistent window calculations caused
+by clock differences between API instances.
+
+---
+
+## 🧮 Rate-Limiting Algorithms
+
+The project supports three algorithms:
+
+| Algorithm      | Strength                            | Trade-off                       | Memory per client |
+| -------------- | ----------------------------------- | ------------------------------- | ----------------- |
+| `fixed`        | Simple and cheap                    | Boundary burst                  | O(1)              |
+| `sliding`      | Accurate rolling window             | Stores requests in the window   | O(N)              |
+| `token_bucket` | Controlled bursts and smooth refill | Not an exact N-per-window model | O(1)              |
+
+### Fixed Window
+
+Divides time into fixed intervals.
+
+For example, with a limit of 10/minute:
+
+```text
+00:59 → 10 requests
+01:00 → counter resets
+01:01 → 10 requests
+```
+
+A client can therefore make up to 20 requests around a window boundary.
+
+### Sliding Window
+
+Tracks request timestamps and considers only requests inside
+the current rolling window.
+
+This avoids the boundary burst of a fixed window.
+
+```text
+Old requests
+     ↓
+[expired] [active requests] ─────────▶ now
+             ↑
+         count here
+```
+
+Redis sorted sets are used to maintain the request timestamps.
+
+### Token Bucket
+
+The token bucket maintains a fixed number of tokens and refills
+them continuously.
+
+```text
+tokens = burst capacity
+
+request → consume 1 token
+
+refill rate =
+RATE_LIMIT / WINDOW_SECONDS
+```
+
+An idle client can accumulate tokens and make a controlled burst,
+while sustained traffic is limited by the refill rate.
+
+Unlike the sliding window, token bucket uses **O(1) state per client**.
 
 ---
 
 ## 💥 When Redis dies
 
-There's no way to know if a client is over its limit, so the policy is explicit
-rather than accidental:
+There is no reliable way to enforce the shared limit when Redis is unavailable,
+so the failure policy is explicit.
 
-| `FAIL_OPEN` | Behaviour | Use when |
-|---|---|---|
-| `true` *(default)* | Serve the request | Availability matters most |
-| `false` | Reject with `429` | Exceeding the limit is worse than downtime |
+| `FAIL_OPEN`        | Behaviour         | Use case                              |
+| ------------------ | ----------------- | ------------------------------------- |
+| `true` *(default)* | Serve the request | Availability is prioritized           |
+| `false`            | Reject with `429` | Rate-limit enforcement is prioritized |
 
-Either way it's logged, counted, and flagged with `X-RateLimit-Degraded: true`.
-`/health` reports `degraded`; limits resume automatically when Redis returns.
+When degraded:
 
-**Liveness ≠ readiness.** Readiness uses `/health`; liveness is a TCP check. A
-liveness probe on `/health` would restart every pod in a loop whenever Redis blipped.
+* Requests are logged.
+* Metrics record the degraded state.
+* `X-RateLimit-Degraded: true` is returned.
+* `/health` reports the degraded condition.
+* Normal rate limiting resumes when Redis recovers.
+
+**Liveness ≠ readiness.**
+
+Readiness uses `/health`.
+
+The Kubernetes liveness probe uses a TCP check so a temporary Redis
+failure does not cause unnecessary container restart loops.
 
 ---
 
 ## 📊 Results
 
-k6, 100 VUs, 3 instances. Throughput varies with hardware; **correctness doesn't**:
+Load testing was performed with 3 API instances.
 
-| | Linux (4 vCPU) | Windows (Docker Desktop) |
-|---|---|---|
-| Throughput | 3,908 req/s | 930 req/s |
-| p95 latency | 27ms | 185ms |
-| Errors | 0.00% | 0.00% |
-| Accuracy test — 200 concurrent on one key | exactly 50 of 50 ✅ | exactly 10 of 10 ✅ |
+Throughput depends on the machine and environment, while correctness
+is expected to remain consistent.
 
-The limiter exports its own decision time, which separates it from the environment:
+| Metric      | Linux (4 vCPU) | Windows (Docker Desktop) |
+| ----------- | -------------: | -----------------------: |
+| Throughput  |    3,908 req/s |                930 req/s |
+| p95 latency |          27 ms |                   185 ms |
+| Errors      |          0.00% |                    0.00% |
 
-| | p50 | p95 |
-|---|---|---|
-| **Limiter decision** | 1.27ms | **2.40ms** |
-| End-to-end request | 27.8ms | **185ms** |
+Limiter decision latency:
 
-The rate limiter is **~1.3% of p95 latency** — the rest is Docker Desktop's WSL2
-network path. 📄 [Full results + how to re-run](loadtest/RESULTS.md)
+| Metric             |     p50 |     p95 |
+| ------------------ | ------: | ------: |
+| Limiter decision   | 1.27 ms | 2.40 ms |
+| End-to-end request | 27.8 ms |  185 ms |
 
----
+The limiter exports its own decision latency so it can be separated
+from infrastructure and network overhead.
 
-## ⚙️ Config & API
-
-| Variable | Default | |
-|---|---|---|
-| `REDIS_URL` | `redis://localhost:6379/0` | shared state |
-| `RATE_LIMIT` | `10` | requests per window |
-| `WINDOW_SECONDS` | `60` | window length |
-| `ALGORITHM` | `sliding` | `fixed`, `sliding` or `token_bucket` |
-| `BURST` | `0` | token_bucket only; `0` = same as `RATE_LIMIT` |
-| `FAIL_OPEN` | `true` | behaviour when Redis is down |
-
-`GET /api/data` is rate limited. `/health`, `/metrics` and `/docs` are exempt, so
-a throttled client can't blind your monitoring.
-
-Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Algorithm`,
-`Retry-After` and `X-Instance` (which instance answered).
-
-> ⚠️ **The API key is used for rate-limit identification in this demonstration;
-> it is not an authentication mechanism.** It's read from the `X-API-Key` header
-> and never verified. Real deployments would derive identity from a validated
-> token *before* the limiter sees it.
+📄 [Full load-test results](loadtest/RESULTS.md)
 
 ---
 
-## 📈 Monitoring · 🧪 Tests · ☸️ Kubernetes
+## ⚙️ Configuration & API
 
-```bash
-pytest                                   # 32 tests, no Redis needed (fakeredis)
-kubectl apply -f k8s/                    # 3 pods + Redis + HPA 3→10 on CPU
+| Variable         | Default                    | Description                                        |
+| ---------------- | -------------------------- | -------------------------------------------------- |
+| `REDIS_URL`      | `redis://localhost:6379/0` | Redis connection                                   |
+| `RATE_LIMIT`     | `10`                       | Requests per window                                |
+| `WINDOW_SECONDS` | `60`                       | Window length                                      |
+| `ALGORITHM`      | `sliding`                  | `fixed`, `sliding`, or `token_bucket`              |
+| `BURST`          | `0`                        | Token-bucket burst capacity; `0` uses `RATE_LIMIT` |
+| `FAIL_OPEN`      | `true`                     | Behavior when Redis is unavailable                 |
+
+### Endpoints
+
+| Endpoint        | Purpose                       |
+| --------------- | ----------------------------- |
+| `GET /api/data` | Rate-limited API endpoint     |
+| `GET /health`   | Health/readiness status       |
+| `GET /metrics`  | Prometheus metrics            |
+| `GET /docs`     | Swagger/OpenAPI documentation |
+
+The health, metrics, and documentation endpoints are exempt from
+rate limiting so monitoring remains available even when a client is throttled.
+
+Responses include:
+
+```text
+X-RateLimit-Limit
+X-RateLimit-Remaining
+X-RateLimit-Algorithm
+Retry-After
+X-Instance
 ```
 
-Prometheus scrapes all three instances; the Grafana dashboard is provisioned from
-files. Metrics: `rl_requests_total{result}` (allowed/rejected), `rl_check_duration_seconds`
-(histogram), `rl_redis_errors_total`, `rl_degraded_requests_total`.
+> ⚠️ **The API key is used only for rate-limit identification in this
+> demonstration. It is not an authentication mechanism.**
+>
+> The `X-API-Key` header is read but never verified. A production system
+> should derive the rate-limit identity from an already authenticated
+> and validated identity.
 
-CI runs ruff, an integration job against a **real** Redis, a Docker build, and
-strict validation of the K8s manifests. 📄 [K8s runbook](k8s/README.md)
+---
 
-> ⚠️ Grafana runs with **anonymous Admin access** so the demo needs no login.
-> Local development only — never expose this stack to a network you don't control.
+## 📈 Monitoring
+
+The project includes:
+
+* Prometheus
+* Grafana
+* Application metrics
+* Per-instance metrics
+* Rate-limit decision latency
+* Redis error tracking
+* Degraded request tracking
+
+Important metrics include:
+
+```text
+rl_requests_total{result}
+rl_check_duration_seconds
+rl_redis_errors_total
+rl_degraded_requests_total
+```
+
+Grafana is provisioned automatically from the repository configuration.
+
+> ⚠️ Grafana uses anonymous Admin access for local development.
+> Do not expose this configuration to an untrusted network.
+
+---
+
+## 🧪 Testing
+
+The project includes unit, API, algorithm, and metrics tests.
+
+Run:
+
+```bash
+python -m pytest -v
+```
+
+Current test suite:
+
+```text
+43 passed
+```
+
+The tests cover:
+
+* API behavior
+* Fixed Window
+* Sliding Window
+* Token Bucket
+* Redis failure behavior
+* Metrics
+* Rate-limit edge cases
+
+Fakeredis is used where Redis is not required for the test.
+
+---
+
+## ☸️ Kubernetes
+
+Kubernetes manifests are included for:
+
+* API deployment
+* Redis
+* Readiness/liveness probes
+* Horizontal Pod Autoscaler
+* Resource requests
+* Distributed API replicas
+
+Example:
+
+```bash
+kubectl apply -f k8s/
+```
+
+The manifests are designed for a Kubernetes environment and are
+validated in CI.
+
+📄 [Kubernetes runbook](k8s/README.md)
+
+---
+
+## 🔄 CI/CD
+
+GitHub Actions runs automated checks including:
+
+* Ruff linting
+* Formatting checks
+* Python tests
+* Redis integration testing
+* Docker image build
+* Kubernetes manifest validation
+
+CI configuration:
+
+```text
+.github/workflows/ci.yml
+```
 
 ---
 
 ## ⚖️ Trade-offs
 
-| Decision | Why | What it costs |
-|---|---|---|
-| **Redis** for shared state | One counter every instance can see | A network hop, and a component that can fail |
-| **Sliding window** | No boundary burst | One sorted-set entry per request, vs one integer |
-| **Lua script** | Atomic, so concurrency can't overshoot | Logic lives in Redis — harder to debug |
-| **Fail-open** default | A Redis outage shouldn't take the API down | An abusive client is unlimited during an outage |
-| **Nginx** in front | Proves the limit holds *across* instances | Another hop; needs DNS re-resolution to avoid stale pods |
-| **Header API key** | Keeps the demo focused on limiting | Unauthenticated — fine for a demo, not production |
+| Decision           | Why                                      | Cost                                    |
+| ------------------ | ---------------------------------------- | --------------------------------------- |
+| **Redis**          | Shared state across instances            | Network dependency                      |
+| **Sliding Window** | Accurate rolling limit                   | O(N) request state                      |
+| **Token Bucket**   | Controlled bursts with O(1) state        | Different semantics from exact N/window |
+| **Lua**            | Atomic Redis operations                  | Logic is harder to debug                |
+| **Fail-open**      | Preserves availability                   | Unlimited requests during Redis outage  |
+| **Nginx**          | Distributes traffic across API instances | Additional network hop                  |
+| **API key header** | Simple rate-limit identity               | Not authentication                      |
 
 ---
 
-## 🔭 Limits & next steps
+## 🔭 Production Considerations
 
-A **production-oriented** rate limiter — built with the concerns a real one has
-(atomicity, shared state, failure policy, probes, metrics) — but not a fully
-production-ready service. The honest gaps:
+This is a **production-oriented portfolio project**, not a claim of being
+a complete production service.
 
-- **Redis is a single point of failure** — one instance, no replication → *Redis Sentinel*
-- **The sliding window's memory grows with traffic** — one entry per request.
-  `ALGORITHM=token_bucket` is already O(1) per client if that matters more than
-  an exact "N per window"
-- **One limit for everyone** → *per-plan limits (`free` 10/min, `pro` 1000/min)*
-- **API keys aren't authenticated** · single region
+Current implementation demonstrates:
 
-📚 Step-by-step build notes: [ROADMAP.md](ROADMAP.md)
+* Distributed shared state
+* Atomic rate-limit decisions
+* Multiple rate-limit algorithms
+* Redis failure handling
+* Observability
+* Containerization
+* Load testing
+* Kubernetes deployment manifests
+* Automated testing and CI
+
+Potential next steps include:
+
+* Redis replication / Sentinel or managed Redis
+* Multi-region deployment
+* Authenticated identity-based rate limiting
+* Per-plan limits
+* Distributed configuration management
+* Advanced burst policies
+* Security hardening
+* Production-grade secret management
+* More extensive benchmarking
+
+---
+
+## 📁 Project Structure
+
+```text
+DistributedRateLimiter/
+├── app/
+│   ├── limiter/
+│   │   ├── fixed_window.py
+│   │   ├── sliding_window.py
+│   │   ├── token_bucket.py
+│   │   └── resilient.py
+│   ├── config.py
+│   ├── main.py
+│   ├── metrics.py
+│   └── redis_client.py
+│
+├── tests/
+│   ├── test_api.py
+│   ├── test_fixed_window.py
+│   ├── test_sliding_window.py
+│   ├── test_token_bucket.py
+│   ├── test_resilient.py
+│   └── test_metrics.py
+│
+├── k8s/
+├── loadtest/
+├── monitoring/
+├── nginx/
+├── scripts/
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
+└── requirements.txt
+```
+
+---
+
+## 🎯 Key Learning
+
+This project focuses on the distributed-systems problem behind rate limiting:
+
+> **When multiple API servers handle the same client, how do they enforce one
+> consistent limit without relying on local memory?**
+
+The solution combines:
+
+```text
+FastAPI
+   ↓
+Nginx
+   ↓
+Multiple API instances
+   ↓
+Redis shared state
+   ↓
+Atomic Lua scripts
+   ↓
+Prometheus + Grafana
+```
+
+It demonstrates distributed state management, concurrency control,
+failure handling, observability, testing, and container orchestration
+in one system.
