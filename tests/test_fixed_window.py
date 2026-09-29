@@ -1,12 +1,4 @@
-import fakeredis
-import pytest
-
 from app.limiter.fixed_window import FixedWindowLimiter
-
-
-@pytest.fixture
-def redis():
-    return fakeredis.FakeRedis(decode_responses=True)
 
 
 def test_blocks_once_the_limit_is_reached(redis):

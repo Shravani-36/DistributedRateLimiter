@@ -21,6 +21,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       RATE_LIMIT: "10"
       WINDOW_SECONDS: "60"
+      # fixed | sliding | token_bucket  (token_bucket also honours BURST)
       ALGORITHM: sliding
     depends_on:
       redis:

@@ -1,6 +1,43 @@
-import time
-
 from app.limiter.base import Decision, RateLimiter
+
+# The bucket number is derived from the clock, so which bucket a request lands
+# in used to depend on whichever API container happened to serve it. Two
+# instances a second apart could disagree about where the minute starts and
+# hand out two separate allowances. Taking the time from Redis removes that:
+# the bucket is computed once, in one place, from one clock.
+#
+# Note: the key is built inside the script rather than passed in, because it
+# depends on the time we have just read. That assumes a single Redis (which is
+# what this project runs); under Redis Cluster every key a script touches has
+# to be declared in KEYS so the slot can be checked up front.
+FIXED_WINDOW_LUA = """
+local prefix = KEYS[1]
+local window = tonumber(ARGV[1])
+local limit  = tonumber(ARGV[2])
+
+local t   = redis.call('TIME')
+local now = tonumber(t[1])
+
+local bucket = math.floor(now / window)
+local key    = string.format('%s:%d', prefix, bucket)
+
+local count = redis.call('INCR', key)
+if count == 1 then
+    -- Only on creation. Refreshing the TTL on every request would keep a
+    -- finished bucket alive long after its minute is over.
+    redis.call('EXPIRE', key, window)
+end
+
+local allowed = 0
+if count <= limit then
+    allowed = 1
+end
+
+-- the whole bucket is spent until the clock rolls into the next one
+local retry_after = window - (now % window)
+
+return {allowed, math.max(0, limit - count), retry_after}
+"""
 
 
 class FixedWindowLimiter(RateLimiter):
@@ -19,27 +56,20 @@ class FixedWindowLimiter(RateLimiter):
         self.redis = redis
         self.limit = limit
         self.window = window
+        self._script = redis.register_script(FIXED_WINDOW_LUA)
 
-    def _key(self, client_id: str, bucket: int) -> str:
-        return f"rl:fixed:{client_id}:{bucket}"
+    def _key(self, client_id: str) -> str:
+        return f"rl:fixed:{client_id}"
 
     def allow(self, client_id: str) -> Decision:
-        now = time.time()
-        bucket = int(now // self.window)
-        key = self._key(client_id, bucket)
-
-        # One round trip: increment, and make sure the key cleans itself up.
-        pipe = self.redis.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, self.window)
-        count, _ = pipe.execute()
-
-        seconds_into_window = now % self.window
-        retry_after = max(1, int(self.window - seconds_into_window))
+        allowed, remaining, retry_after = self._script(
+            keys=[self._key(client_id)],
+            args=[self.window, self.limit],
+        )
 
         return Decision(
-            allowed=count <= self.limit,
+            allowed=bool(allowed),
             limit=self.limit,
-            remaining=max(0, self.limit - count),
-            retry_after=retry_after,
+            remaining=int(remaining),
+            retry_after=max(1, int(retry_after)),
         )

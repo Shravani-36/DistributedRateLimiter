@@ -1,41 +1,5 @@
-import fakeredis
-import pytest
-
 from app.limiter.fixed_window import FixedWindowLimiter
 from app.limiter.sliding_window import SlidingWindowLimiter
-
-
-@pytest.fixture
-def redis():
-    return fakeredis.FakeRedis(decode_responses=True)
-
-
-class FakeClock:
-    """Stands in for the `time` module inside the limiters.
-
-    Tests about window edges have to control where the edge falls. Sleeping
-    towards a real one made them fail on a slow or loaded machine, where the
-    requests themselves drifted across the boundary before the sleep did.
-    """
-
-    def __init__(self, now: float):
-        self.now = now
-
-    def time(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-@pytest.fixture
-def clock(monkeypatch):
-    # Both limiters call time.time() through their module-level import, so
-    # swapping that module out is enough - no production code changes.
-    fake = FakeClock(now=1_000_000.0)
-    monkeypatch.setattr("app.limiter.fixed_window.time", fake)
-    monkeypatch.setattr("app.limiter.sliding_window.time", fake)
-    return fake
 
 
 def test_blocks_once_the_limit_is_reached(redis):

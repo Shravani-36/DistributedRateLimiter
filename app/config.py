@@ -13,8 +13,14 @@ class Settings(BaseSettings):
     rate_limit: int = 10
     window_seconds: int = 60
 
-    # "fixed" (simple, cheap) or "sliding" (accurate, no boundary burst)
+    # "fixed"        - simplest, but allows a burst across the bucket boundary
+    # "sliding"      - accurate rolling window, no boundary burst
+    # "token_bucket" - allows controlled bursts, then a steady refill
     algorithm: str = "sliding"
+
+    # token_bucket only: the biggest burst allowed before the steady rate
+    # takes over. 0 means "the same as rate_limit".
+    burst: int = 0
 
     # What to do when Redis is unreachable:
     # True  -> serve the request anyway (availability first)
